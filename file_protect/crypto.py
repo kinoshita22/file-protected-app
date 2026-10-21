@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import struct
+import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -29,6 +30,9 @@ EXTENSION = ".fpa"
 SALT_SIZE = 16
 NONCE_PREFIX_SIZE = 8
 CHUNK_SIZE = 1024 * 1024
+# Largest chunk the FPA1 format allows. Fixed, so files stay readable if CHUNK_SIZE changes.
+MAX_CHUNK_SIZE = 1024 * 1024
+TAG_SIZE = 16
 HEADER_SIZE = len(MAGIC) + 1 + SALT_SIZE + NONCE_PREFIX_SIZE
 
 # depth level -> (label, scrypt log2(N)); memory use is 128 * r * N bytes (r = 8).
@@ -66,6 +70,12 @@ def _nonce(prefix: bytes, index: int) -> bytes:
     return prefix + struct.pack(">I", index)
 
 
+def _open_temp(dst: Path):
+    """Create a new, uniquely named temp file next to `dst`. Returns (file, path)."""
+    fd, name = tempfile.mkstemp(prefix=dst.name + ".", suffix=".part", dir=dst.parent)
+    return os.fdopen(fd, "wb"), Path(name)
+
+
 def unique_path(path: Path) -> Path:
     """Return `path`, or a variant with " (n)" appended if it already exists."""
     if not path.exists():
@@ -96,6 +106,8 @@ def encrypt_file(
     depth: int = DEFAULT_DEPTH,
     progress: Optional[ProgressCallback] = None,
 ) -> None:
+    if CHUNK_SIZE > MAX_CHUNK_SIZE:
+        raise ValueError("CHUNK_SIZE exceeds the format's maximum chunk size")
     salt = os.urandom(SALT_SIZE)
     nonce_prefix = os.urandom(NONCE_PREFIX_SIZE)
     header = MAGIC + bytes([depth]) + salt + nonce_prefix
@@ -103,9 +115,9 @@ def encrypt_file(
 
     total = src.stat().st_size
     done = 0
-    tmp = dst.with_name(dst.name + ".part")
+    fout, tmp = _open_temp(dst)
     try:
-        with open(src, "rb") as fin, open(tmp, "wb") as fout:
+        with open(src, "rb") as fin, fout:
             fout.write(header)
             index = 0
             chunk = fin.read(CHUNK_SIZE)
@@ -143,7 +155,7 @@ def decrypt_file(
     progress: Optional[ProgressCallback] = None,
 ) -> None:
     total = src.stat().st_size
-    tmp = dst.with_name(dst.name + ".part")
+    tmp: Optional[Path] = None
     try:
         with open(src, "rb") as fin:
             header = fin.read(HEADER_SIZE)
@@ -156,7 +168,8 @@ def decrypt_file(
             nonce_prefix = header[-NONCE_PREFIX_SIZE:]
             aesgcm = AESGCM(derive_key(password, salt, depth))
 
-            with open(tmp, "wb") as fout:
+            fout, tmp = _open_temp(dst)
+            with fout:
                 index = 0
                 done = HEADER_SIZE
                 while True:
@@ -164,7 +177,7 @@ def decrypt_file(
                     if len(length_bytes) != 4:
                         raise DecryptionError("File is truncated or corrupt")
                     (length,) = struct.unpack(">I", length_bytes)
-                    if length > CHUNK_SIZE + 16:
+                    if length > MAX_CHUNK_SIZE + TAG_SIZE:
                         raise DecryptionError("File is corrupt")
                     ct = fin.read(length)
                     if len(ct) != length:
@@ -185,5 +198,6 @@ def decrypt_file(
                     index += 1
         os.replace(tmp, dst)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
         raise
