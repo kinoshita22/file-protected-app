@@ -38,7 +38,54 @@ def test_wrong_password(tmp_path: Path):
     with pytest.raises(crypto.DecryptionError, match="Wrong password"):
         crypto.decrypt_file(enc, out, "password2")
     assert not out.exists()
-    assert not (tmp_path / "out.part").exists()
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_existing_part_file_untouched(tmp_path: Path):
+    src = tmp_path / "a.txt"
+    src.write_bytes(b"secret")
+    enc = tmp_path / "a.txt.fpa"
+    crypto.encrypt_file(src, enc, "password1", depth=1)
+    # A user file named like the old fixed temp path must survive a failed run.
+    bystander = tmp_path / "out.part"
+    bystander.write_bytes(b"user data")
+    with pytest.raises(crypto.DecryptionError):
+        crypto.decrypt_file(enc, tmp_path / "out", "wrong")
+    assert bystander.read_bytes() == b"user data"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.txt", "a.txt.fpa", "out.part"]
+
+
+@pytest.mark.parametrize("op", ["encrypt", "decrypt"])
+def test_abort_from_progress_leaves_no_output(tmp_path: Path, op: str):
+    src = tmp_path / "a.bin"
+    src.write_bytes(os.urandom(3000))
+    enc = tmp_path / "a.bin.fpa"
+    crypto.encrypt_file(src, enc, "password1", depth=1)
+
+    def abort(done, total):
+        raise KeyboardInterrupt
+
+    out = tmp_path / "out"
+    with pytest.raises(KeyboardInterrupt):
+        if op == "encrypt":
+            crypto.encrypt_file(src, out, "password1", depth=1, progress=abort)
+        else:
+            crypto.decrypt_file(enc, out, "password1", progress=abort)
+    assert not out.exists()
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_decrypt_accepts_chunks_larger_than_current_chunk_size(tmp_path: Path, monkeypatch):
+    src = tmp_path / "a.bin"
+    data = os.urandom(5000)
+    src.write_bytes(data)
+    enc = tmp_path / "a.bin.fpa"
+    monkeypatch.setattr(crypto, "CHUNK_SIZE", 4096)
+    crypto.encrypt_file(src, enc, "password1", depth=1)
+    monkeypatch.setattr(crypto, "CHUNK_SIZE", 1024)
+    out = tmp_path / "out"
+    crypto.decrypt_file(enc, out, "password1")
+    assert out.read_bytes() == data
 
 
 @pytest.mark.parametrize("mutation", ["truncate_chunk", "append", "flip", "depth"])

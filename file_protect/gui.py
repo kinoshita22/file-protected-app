@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 from typing import List
 
@@ -33,13 +34,17 @@ from . import crypto
 MIN_PASSWORD_LENGTH = 8
 
 
+class Cancelled(Exception):
+    """Raised from the progress callback to abort the current file."""
+
+
 class Worker(QObject):
     """Encrypts or decrypts a list of files on a background thread."""
 
     file_started = pyqtSignal(int, str)
     file_progress = pyqtSignal(int)  # percent of the current file
     file_finished = pyqtSignal(str, bool, str)  # source, success, message
-    finished = pyqtSignal(int, int)  # succeeded, failed
+    finished = pyqtSignal(int, int, bool)  # succeeded, failed, cancelled
 
     def __init__(self, files: List[Path], password: str, encrypt: bool, depth: int, delete_originals: bool):
         super().__init__()
@@ -48,13 +53,22 @@ class Worker(QObject):
         self.encrypt = encrypt
         self.depth = depth
         self.delete_originals = delete_originals
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        """Request cancellation; safe to call from any thread."""
+        self._cancel.set()
 
     def _report(self, done: int, total: int) -> None:
+        if self._cancel.is_set():
+            raise Cancelled
         self.file_progress.emit(100 if total == 0 else int(done * 100 / total))
 
     def run(self) -> None:
         ok = failed = 0
         for i, src in enumerate(self.files):
+            if self._cancel.is_set():
+                break
             self.file_started.emit(i, str(src))
             try:
                 if self.encrypt:
@@ -63,14 +77,26 @@ class Worker(QObject):
                 else:
                     dst = crypto.decrypted_output_path(src)
                     crypto.decrypt_file(src, dst, self.password, self._report)
-                if self.delete_originals:
-                    src.unlink()
-                ok += 1
-                self.file_finished.emit(str(src), True, f"→ {dst.name}")
+            except Cancelled:
+                self.file_finished.emit(str(src), False, "cancelled, no output written")
+                break
             except Exception as exc:  # report per-file failures and keep going
                 failed += 1
                 self.file_finished.emit(str(src), False, str(exc))
-        self.finished.emit(ok, failed)
+                continue
+            if self.delete_originals:
+                try:
+                    src.unlink()
+                except OSError as exc:
+                    # The output exists; say so, so the user doesn't run it again.
+                    failed += 1
+                    self.file_finished.emit(
+                        str(src), False, f"saved as {dst.name}, but the original could not be deleted: {exc}"
+                    )
+                    continue
+            ok += 1
+            self.file_finished.emit(str(src), True, f"→ {dst.name}")
+        self.finished.emit(ok, failed, self._cancel.is_set())
 
 
 class MainWindow(QMainWindow):
@@ -81,6 +107,7 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         self.worker: Worker | None = None
         self._current_index = 0
+        self._closing = False
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -88,10 +115,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_options_group())
         layout.addWidget(self._build_password_group())
 
+        run_row = QHBoxLayout()
         self.run_button = QPushButton()
         self.run_button.setMinimumHeight(36)
         self.run_button.clicked.connect(self._start)
-        layout.addWidget(self.run_button)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setMinimumHeight(36)
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self._cancel)
+        run_row.addWidget(self.run_button, 1)
+        run_row.addWidget(self.cancel_button)
+        layout.addLayout(run_row)
 
         self.progress = QProgressBar()
         self.progress.setFormat("%p%")
@@ -169,6 +203,10 @@ class MainWindow(QMainWindow):
         form.addRow(self.depth_label, self.depth_combo)
 
         self.delete_check = QCheckBox("Delete original files after success")
+        self.delete_check.setToolTip(
+            "Files are deleted normally, not securely wiped.\n"
+            "Their contents may still be recoverable from the disk."
+        )
         form.addRow("", self.delete_check)
         return group
 
@@ -268,8 +306,9 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "Delete originals?",
-                f"The {len(files)} original file(s) will be permanently deleted after "
-                "they are processed successfully. Continue?",
+                f"The {len(files)} original file(s) will be deleted after they are "
+                "processed successfully.\n\nThis is a normal delete, not a secure wipe: "
+                "the contents may still be recoverable from the disk. Continue?",
             )
             if answer != QMessageBox.Yes:
                 return
@@ -294,8 +333,21 @@ class MainWindow(QMainWindow):
         self.worker.file_finished.connect(self._on_file_finished)
         self.worker.finished.connect(self._on_finished)
         self.worker.finished.connect(self.thread.quit)
+        self.thread.finished.connect(self._on_thread_finished)
         self.thread.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
+
+    def _cancel(self) -> None:
+        if self.worker is not None:
+            self.worker.cancel()
+            self.cancel_button.setEnabled(False)
+            self.statusBar().showMessage("Cancelling…")
+
+    def _on_thread_finished(self) -> None:
+        # Both objects are scheduled for deletion; drop the references.
+        self.thread = None
+        self.worker = None
 
     def _on_file_started(self, index: int, path: str) -> None:
         self._current_index = index
@@ -308,13 +360,20 @@ class MainWindow(QMainWindow):
         name = Path(path).name
         self.log.appendPlainText(f"✔ {name} {message}" if success else f"✘ {name}: {message}")
 
-    def _on_finished(self, ok: int, failed: int) -> None:
-        self.progress.setValue(self.progress.maximum())
-        summary = f"Done: {ok} succeeded, {failed} failed."
+    def _on_finished(self, ok: int, failed: int, cancelled: bool) -> None:
+        if self._closing:
+            return
+        if cancelled:
+            summary = f"Cancelled: {ok} succeeded, {failed} failed before stopping."
+        else:
+            self.progress.setValue(self.progress.maximum())
+            summary = f"Done: {ok} succeeded, {failed} failed."
         self.log.appendPlainText(summary)
         self.statusBar().showMessage(summary, 10000)
         self._set_busy(False)
-        if failed == 0:
+        if cancelled:
+            QMessageBox.information(self, "Cancelled", summary)
+        elif failed == 0:
             self.file_list.clear()
             self.password_edit.clear()
             self.confirm_edit.clear()
@@ -329,13 +388,23 @@ class MainWindow(QMainWindow):
         encrypting = self.encrypt_radio.isChecked()
         for w in (self.depth_combo, self.depth_label, self.confirm_edit, self.confirm_label):
             w.setEnabled(not busy and encrypting)
+        self.cancel_button.setEnabled(busy)
         self.setCursor(Qt.BusyCursor if busy else Qt.ArrowCursor)
 
     def closeEvent(self, event) -> None:
         if self.thread is not None and self.thread.isRunning():
-            QMessageBox.information(self, "Busy", "Please wait for the current operation to finish.")
-            event.ignore()
-            return
+            answer = QMessageBox.question(
+                self,
+                "Operation in progress",
+                "Cancel the current operation and quit?\n"
+                "Files already finished are kept; the file in progress is not written.",
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._closing = True
+            self.worker.cancel()
+            self.thread.wait()  # at most one key derivation (about 1 s at depth 5)
         super().closeEvent(event)
 
 

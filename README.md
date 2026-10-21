@@ -8,8 +8,8 @@ A PyQt5 desktop app that encrypts and decrypts files with a password.
 - Choose a mode: **Encrypt** or **Decrypt**
 - Encryption depth from 1 (Fast) to 5 (Maximum). Higher levels make password guessing slower.
 - Password entry with confirmation, a "show password" toggle and live checks (encryption needs at least 8 characters)
-- Can delete the original files after a successful run
-- Work runs on a background thread with a progress bar and a log for each file
+- Can delete the original files after a successful run. This is a normal delete, not a secure wipe, so the contents may still be recoverable from the disk.
+- Work runs on a background thread with a progress bar, a log for each file and a Cancel button. Cancelling never leaves a partial output file.
 
 ## Install and run
 
